@@ -1,0 +1,8 @@
+- Care about endianness in memory (specifically for reading .text)
+- Get sim running w/ test assembly, verify li and add work for now, just to see
+- Finish migrating to wishbone bus (it's pretty easy)
+- Implement traps/exceptions system
+- Implement system counters
+  - CYCLE: clock cycles from arbitrary start time (i.e. reset)
+  - TIME: wall-clock time (i.e. CYCLE/freq for this simple core)
+  - INSTRET: instructions retired (does this include trapped instructions??)

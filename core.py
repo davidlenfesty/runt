@@ -6,18 +6,10 @@ from enum import Enum
 from opcodes import Opcodes
 from instruction_decoder import InstructionDecoder
 from regfile import RegisterFile
+import nmigen_soc.wishbone as wishbone
+from nmigen_soc.memory import *
 
 # TODO replace this with a proper wishbone bus
-class DumbMemoryBus(Record):
-    def __init__(self):
-        super().__init__(Layout([
-            ("rw", 1),
-            ("addr", unsigned(32)),
-            ("data", unsigned(32)),
-            ("i_valid", 1),
-            ("o_ready", 1),
-        ]))
-
 class IntImmediate(Enum):
     # Integer opperations on immediates, as defined by funct3 field
     ADDI  = 0b000
@@ -57,10 +49,10 @@ class LSWidth(Enum):
 
 class RV32ICore(Elaboratable):
     """Basic RV32-I core."""
-    def __init__(self):
+    def __init__(self, mem_bus: wishbone.Interface):
 
-        self.mem = DumbMemoryBus()
         self.decoder = InstructionDecoder()
+        self.mem = mem_bus
 
     def elaborate(self, platform):
         m = Module()
@@ -82,8 +74,10 @@ class RV32ICore(Elaboratable):
         m.d.comb += self.decoder.instr.eq(instr)
 
         m.d.sync += regfile.wen.eq(0)
-        m.d.sync += self.mem.i_valid.eq(0)
 
+        # Default memory bus to inactive
+        m.d.sync += self.mem.stb.eq(0)
+        m.d.sync += self.mem.cyc.eq(0)
 
         # Load/store variables
         load_dest = Signal(unsigned(5))
@@ -93,16 +87,19 @@ class RV32ICore(Elaboratable):
         with m.FSM():
             with m.State("READ_PC"):
                 # Issue memory read to PC
-                m.d.sync += self.mem.rw.eq(0)
-                m.d.sync += self.mem.addr.eq(pc)
-                m.d.sync += self.mem.i_valid.eq(1)
-                m.next = "LOAD_PC"
+                # TODO there may be some issues with this naive WB implementation,
+                #      specifically around slave ACK response, too tired atm to deal with it though
+                m.d.sync += self.mem.cyc.eq(1)  # Valid bus cycle - begin wishbone bus operation
+                m.d.sync += self.mem.stb.eq(1)  # Start data transfer cycle
+                m.d.sync += self.mem.we.eq(0)   # Read data
+                m.d.sync += self.mem.adr.eq(pc)
+                # TODO do I need to set sel? what should granularity of bus be?
 
-            with m.State("LOAD_PC"):
-                m.d.sync += self.mem.i_valid.eq(0)
-
-                with m.If(self.mem.o_ready):
-                    m.d.sync += instr.eq(self.mem.data)
+                with m.If(self.mem.ack):
+                    # De-assert bus
+                    m.d.sync += self.mem.cyc.eq(0)
+                    m.d.sync += self.mem.stb.eq(0)
+                    m.d.sync += instr.eq(self.mem.dat_r)
                     m.next = "DECODE"
 
             with m.State("DECODE"):
@@ -236,29 +233,29 @@ class RV32ICore(Elaboratable):
                         with m.If(branch_condition):
                             m.d.sync += pc.eq(pc + self.decoder.imm)
 
-                    with m.Case(Opcodes.LOAD):
-                        m.d.comb += regfile.raddr1.eq(self.decoder.src1)
-                        m.d.sync += load_dest.eq(self.decoder.dest)
+                    #with m.Case(Opcodes.LOAD):
+                    #    m.d.comb += regfile.raddr1.eq(self.decoder.src1)
+                    #    m.d.sync += load_dest.eq(self.decoder.dest)
 
-                        with m.If(~self.mem.o_ready):
-                            m.next = "LOAD"
-                            m.d.sync += self.mem.rw.eq(0)
-                            m.d.sync += self.mem.addr.eq(regfile.rdata1 + self.decoder.imm)
-                            m.d.sync += self.mem.i_valid.eq(1)
-                            m.d.sync += ls_width.eq(self.decoder.funct3[0:1])
-                            m.d.sync += load_unsigned.eq(self.decoder.funct3[2])
+                    #    with m.If(~self.mem.o_ready):
+                    #        m.next = "LOAD"
+                    #        m.d.sync += self.mem.rw.eq(0)
+                    #        m.d.sync += self.mem.addr.eq(regfile.rdata1 + self.decoder.imm)
+                    #        m.d.sync += self.mem.i_valid.eq(1)
+                    #        m.d.sync += ls_width.eq(self.decoder.funct3[0:1])
+                    #        m.d.sync += load_unsigned.eq(self.decoder.funct3[2])
 
-                    with m.Case(Opcodes.STORE):
-                        m.d.comb += regfile.raddr1.eq(self.decoder.src1)
-                        m.d.comb += regfile.raddr2.eq(self.decoder.base)
+                    #with m.Case(Opcodes.STORE):
+                    #    m.d.comb += regfile.raddr1.eq(self.decoder.src1)
+                    #    m.d.comb += regfile.raddr2.eq(self.decoder.base)
 
-                        with m.If(~self.mem.o_ready):
-                            m.next = "STORE"
-                            m.d.sync += self.mem.rw.eq(1)
-                            m.d.sync += self.mem.addr.eq(regfile.rdata2 + self.decoder.imm)
-                            m.d.sync += self.mem.data.eq(regfile.rdata1)
-                            m.d.sync += self.mem.i_valid.eq(1)
-                            m.d.sync += ls_width.eq(self.decoder.funct3[0:1])
+                    #    with m.If(~self.mem.o_ready):
+                    #        m.next = "STORE"
+                    #        m.d.sync += self.mem.rw.eq(1)
+                    #        m.d.sync += self.mem.addr.eq(regfile.rdata2 + self.decoder.imm)
+                    #        m.d.sync += self.mem.data.eq(regfile.rdata1)
+                    #        m.d.sync += self.mem.i_valid.eq(1)
+                    #        m.d.sync += ls_width.eq(self.decoder.funct3[0:1])
 
                     with m.Case(Opcodes.MISC_MEM):
                         with m.If(self.decoder.funct3 == 0):
@@ -270,6 +267,7 @@ class RV32ICore(Elaboratable):
 
                     with m.Case(Opcodes.SYSTEM):
                         # TODO need to impl privileged stuff before I can do this
+                        # Do I????
                         pass
 
                     # TODO raise invalid instruction
@@ -277,13 +275,14 @@ class RV32ICore(Elaboratable):
                         pass
 
 
-            with m.State("LOAD"):
-                m.d.comb += regfile.waddr.eq(load_dest)
-                m.d.sync += regfile.wdata.eq(self.mem.data)
+            #with m.State("LOAD"):
+            #    # TODO convert to wishbone properly
+            #    m.d.comb += regfile.waddr.eq(load_dest)
+            #    m.d.sync += regfile.wdata.eq(self.mem.dat_r)
 
-                with m.If(self.mem.o_ready):
-                    m.d.sync += regfile.wen.eq(1)
-                    m.next = "READ_PC"
+            #    with m.If(self.mem.ack):
+            #        m.d.sync += regfile.wen.eq(1)
+            #        m.next = "READ_PC"
 
             with m.State("STORE"):
                 # TODO this shouldn't be necessary, just temp until memory is handled properly
@@ -291,8 +290,60 @@ class RV32ICore(Elaboratable):
 
         return m
 
+# TODO care about endianness in core
+class SimulationMemory(Elaboratable):
+    def __init__(self, mem_file: str, bus: wishbone.Interface):
+
+        # Open memory file
+        data = open(mem_file, "rb").read()
+
+        self.bus = bus
+
+        self.memory = Memory(width=32, depth=0x1000, init=data)
+        self.r_port = self.memory.read_port()
+
+
+    def elaborate(self, platform):
+        m = Module()
+
+        # TODO what are submodules again?
+        #      do they just have to be defined to elaborate properly?
+        m.submodules.r_port = self.r_port
+
+        # Wait an extra cycle after getting address for memory latency
+        cyc_latch = Signal(1)
+        m.d.sync += cyc_latch.eq(self.bus.cyc)
+        # The AND here is needed to respond immediately to CYC deassertion
+        m.d.sync += self.bus.ack.eq(cyc_latch & self.bus.cyc)
+
+        # Operate on words
+        m.d.comb += self.r_port.addr.eq(self.bus.adr >> 2)
+
+        # Write data out to bus
+        m.d.sync += self.bus.dat_w.eq(self.r_port.data)
+
+        return m
+
+class SimTop(Elaboratable):
+    def __init__(self):
+        master_wb = wishbone.Interface(addr_width=32, data_width=32)
+        memory_wb = wishbone.Interface(addr_width=32, data_width=32)
+        master_wb.connect(memory_wb)
+
+        self.cpu = RV32ICore(master_wb)
+        self.memory = SimulationMemory("test.bin", memory_wb)
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.submodules.cpu = self.cpu
+        m.submodules.memory = self.memory
+
+        return m
+
 if __name__ == "__main__":
     from nmigen.cli import main
-    top = RV32ICore()
+    #top = RV32ICore(wishbone.Interface(addr_width=32, data_width=32))
+    top = SimTop()
 
     main(top)
